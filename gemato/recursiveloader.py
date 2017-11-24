@@ -4,6 +4,7 @@
 # Licensed under the terms of 2-clause BSD license
 
 import errno
+import multiprocessing
 import os.path
 
 import gemato.compression
@@ -12,6 +13,70 @@ import gemato.manifest
 import gemato.profile
 import gemato.util
 import gemato.verify
+
+
+class SubprocessVerifier(object):
+    """
+    Helper class used to verify directories in subprocesses.
+    """
+
+    __slots__ = ['entry_dict', 'top_level_manifest_filename',
+                 'manifest_device', 'fail_handler', 'last_mtime']
+
+    def __init__(self, entry_dict, top_level_manifest_filename,
+                 manifest_device, fail_handler, last_mtime):
+        self.entry_dict = entry_dict
+        self.top_level_manifest_filename = top_level_manifest_filename
+        self.manifest_device = manifest_device
+        self.fail_handler = fail_handler
+        self.last_mtime = last_mtime
+
+    def _verify_one_file(self, path, relpath, e):
+        ret, diff = gemato.verify.verify_path(path, e,
+                expected_dev=self.manifest_device,
+                last_mtime=self.last_mtime)
+
+        if not ret:
+            err = gemato.exceptions.ManifestMismatch(relpath, e, diff)
+            ret = self.fail_handler(err)
+            if ret is None:
+                ret = True
+
+        return ret
+
+    def __call__(self, vals):
+        """
+        Verify the specified directory and return the boolean value
+        (or raise an exception).
+        """
+
+        ret = True
+        dirpath, relpath, dirnames, filenames = vals
+
+        for d in dirnames:
+            # we already stripped ignored directories in walker,
+            # so go straight for verification
+            dpath = os.path.join(relpath, d)
+            de = self.entry_dict.pop(dpath, None)
+            if de is not None:
+                ret &= self._verify_one_file(os.path.join(dirpath, d),
+                        dpath, de)
+
+        for f in filenames:
+            # skip dotfiles
+            if f.startswith('.'):
+                continue
+
+            fpath = os.path.join(relpath, f)
+            # skip top-level Manifest, we obviously can't have
+            # an entry for it
+            if fpath == self.top_level_manifest_filename:
+                continue
+            fe = self.entry_dict.pop(fpath, None)
+            ret &= self._verify_one_file(os.path.join(dirpath, f),
+                    fpath, fe)
+
+        return ret
 
 
 class ManifestRecursiveLoader(object):
@@ -387,23 +452,9 @@ class ManifestRecursiveLoader(object):
                     out[fullpath] = e
         return out
 
-    def _verify_one_file(self, path, relpath, e, fail_handler,
-            last_mtime):
-        ret, diff = gemato.verify.verify_path(path, e,
-                expected_dev=self.manifest_device,
-                last_mtime=last_mtime)
-
-        if not ret:
-            err = gemato.exceptions.ManifestMismatch(relpath, e, diff)
-            ret = fail_handler(err)
-            if ret is None:
-                ret = True
-
-        return ret
-
     def assert_directory_verifies(self, path='',
             fail_handler=gemato.util.throw_exception,
-            last_mtime=None):
+            last_mtime=None, jobs=None):
         """
         Verify the complete directory tree starting at @path (relative
         to top Manifest directory). Includes testing for stray files.
@@ -425,65 +476,69 @@ class ManifestRecursiveLoader(object):
         than that value (in st_mtime format) will be checked. Use this
         option *only* if mtimes can not be manipulated (i.e. do not use
         it with 'rsync --times')!
+
+        @jobs specifies the number of parallel jobs to use. If set
+        to None (the default), the number of system CPUs will be used.
         """
 
         entry_dict = self.get_file_entry_dict(path)
         it = os.walk(os.path.join(self.root_directory, path),
                 onerror=gemato.util.throw_exception,
                 followlinks=True)
-        ret = True
 
-        for dirpath, dirnames, filenames in it:
-            relpath = os.path.relpath(dirpath, self.root_directory)
-            # strip dot to avoid matching problems
-            if relpath == '.':
-                relpath = ''
+        def _walk_directory(it):
+            """
+            Pre-process os.walk() result for verification. Yield objects
+            suitable to passing to subprocesses.
+            """
+            for dirpath, dirnames, filenames in it:
+                relpath = os.path.relpath(dirpath, self.root_directory)
+                # strip dot to avoid matching problems
+                if relpath == '.':
+                    relpath = ''
 
-            skip_dirs = []
-            for d in dirnames:
-                # skip dotfiles
-                if d.startswith('.'):
-                    skip_dirs.append(d)
-                    continue
+                skip_dirs = []
+                for d in dirnames:
+                    # skip dotfiles
+                    if d.startswith('.'):
+                        skip_dirs.append(d)
+                        continue
 
-                dpath = os.path.join(relpath, d)
-                de = entry_dict.pop(dpath, None)
-                if de is None:
-                    syspath = os.path.join(dirpath, d)
-                    st = os.stat(syspath)
-                    if st.st_dev != self.manifest_device:
-                        raise gemato.exceptions.ManifestCrossDevice(syspath)
-                    continue
+                    dpath = os.path.join(relpath, d)
+                    de = entry_dict.get(dpath)
+                    if de is None:
+                        syspath = os.path.join(dirpath, d)
+                        st = os.stat(syspath)
+                        if st.st_dev != self.manifest_device:
+                            raise gemato.exceptions.ManifestCrossDevice(syspath)
+                        continue
 
-                if de.tag == 'IGNORE':
-                    skip_dirs.append(d)
-                else:
-                    ret &= self._verify_one_file(os.path.join(dirpath, d),
-                            dpath, de, fail_handler, last_mtime)
+                    if de.tag == 'IGNORE':
+                        skip_dirs.append(d)
+                        del entry_dict[dpath]
 
-            # skip scanning ignored directories
-            for d in skip_dirs:
-                dirnames.remove(d)
+                # skip scanning ignored directories
+                for d in skip_dirs:
+                    dirnames.remove(d)
 
-            for f in filenames:
-                # skip dotfiles
-                if f.startswith('.'):
-                    continue
+                yield (dirpath, relpath, dirnames, filenames)
 
-                fpath = os.path.join(relpath, f)
-                # skip top-level Manifest, we obviously can't have
-                # an entry for it
-                if fpath == self.top_level_manifest_filename:
-                    continue
-                fe = entry_dict.pop(fpath, None)
-                ret &= self._verify_one_file(os.path.join(dirpath, f),
-                        fpath, fe, fail_handler, last_mtime)
+        with multiprocessing.Manager() as manager:
+            entry_dict = manager.dict(entry_dict)
+            verifier = SubprocessVerifier(entry_dict,
+                    self.top_level_manifest_filename,
+                    self.manifest_device,
+                    fail_handler, last_mtime)
 
-        # check for missing files
-        for relpath, e in entry_dict.items():
-            syspath = os.path.join(self.root_directory, relpath)
-            ret &= self._verify_one_file(syspath, relpath, e,
-                            fail_handler, last_mtime)
+            with multiprocessing.Pool(processes=jobs) as pool:
+                # verify the directories in parallel
+                ret = all(pool.map(verifier, _walk_directory(it),
+                                   chunksize=64))
+
+            # check for missing files
+            for relpath, e in entry_dict.items():
+                syspath = os.path.join(self.root_directory, relpath)
+                ret &= verifier._verify_one_file(syspath, relpath, e)
 
         return ret
 
