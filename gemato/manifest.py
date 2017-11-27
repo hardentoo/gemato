@@ -3,6 +3,7 @@
 # (c) 2017 Michał Górny
 # Licensed under the terms of 2-clause BSD license
 
+import collections
 import datetime
 import io
 import os.path
@@ -331,13 +332,33 @@ class ManifestState(object):
     POST_SIGNED_DATA = 4
 
 
+class WatchedList(list):
+    def __init__(self):
+        list.__init__(self)
+        self.dirty = True
+
+    def _mutator(f):
+        def wrapper(self, *args, **kwargs):
+            self.dirty = True
+            return f(self, *args, **kwargs)
+        return wrapper
+
+    append = _mutator(list.append)
+    remove = _mutator(list.remove)
+
+
+class Tree(collections.defaultdict):
+    def __init__(self):
+        collections.defaultdict.__init__(self, Tree)
+
+
 class ManifestFile(object):
     """
     A class encapsulating a single Manifest file. It supports reading
     from files and writing to them.
     """
 
-    __slots__ = ['entries', 'openpgp_signed']
+    __slots__ = ['entries', 'openpgp_signed', 'path_cache']
 
     def __init__(self, f=None):
         """
@@ -345,8 +366,9 @@ class ManifestFile(object):
         from open Manifest file @f (see load()).
         """
 
-        self.entries = []
+        self.entries = WatchedList()
         self.openpgp_signed = None
+        self.path_cache = None
         if f is not None:
             self.load(f)
 
@@ -366,7 +388,7 @@ class ManifestFile(object):
         -- it will be loaded completely.
         """
 
-        self.entries = []
+        self.entries = WatchedList()
         self.openpgp_signed = False
         state = ManifestState.DATA
         openpgp_data = ''
@@ -459,7 +481,7 @@ class ManifestFile(object):
             sign_openpgp = self.openpgp_signed
 
         if sort:
-            self.entries = sorted(self.entries)
+            self.entries.sort()
 
         if sign_openpgp:
             with io.StringIO() as data:
@@ -527,6 +549,82 @@ class ManifestFile(object):
                 mdir = os.path.dirname(e.path)
                 if gemato.util.path_inside_dir(path, mdir):
                     yield e
+
+    def _entries_cache(f):
+        def wrapper(self, *args, **kwargs):
+            if self.entries.dirty:
+                self.path_cache = path_cache = Tree()
+                for e in self.entries:
+                    if not isinstance(e, ManifestPathEntry):
+                        continue
+                    elements = e.path.split(os.sep)
+                    elements.reverse()
+                    node = path_cache
+                    while elements:
+                        element = elements.pop()
+                        if elements:
+                            node = node[element]
+                        else:
+                            # duplicates are allowed
+                            node.setdefault(element, []).append(e)
+
+                self.entries.dirty = False
+            return f(self, *args, **kwargs)
+        return wrapper
+
+    @_entries_cache
+    def traverse_manifests_for_path(self, path, recursive=False):
+        """
+        Find all MANIFEST entries that could affect the path @path
+        and return an iterator over them. Yield an empty list when
+        there are no matching MANIFEST entries.
+        """
+        if recursive:
+            for e in self.find_entries_path_starts_with(path):
+                if e.tag == 'MANIFEST':
+                    yield e
+
+        node = self.path_cache
+        for child in node.values():
+            if not isinstance(child, Tree):
+                for e in child:
+                    if e.tag == 'MANIFEST':
+                        yield e
+
+        for element in path.split(os.sep):
+            node = node.get(element, self)
+            if node is self:
+                break
+            if not isinstance(node, Tree):
+                break
+            for child in node.values():
+                if not isinstance(child, Tree):
+                    for e in child:
+                        if e.tag == 'MANIFEST':
+                            yield e
+
+    @_entries_cache
+    def find_entries_path_starts_with(self, path):
+        """
+        Find all entries for local files that start with the given path.
+        """
+        elements = path.split(os.sep) if path else []
+        elements.reverse()
+        node = self.path_cache
+        while elements:
+            element = elements.pop()
+            node = node.get(element)
+            if not isinstance(node, Tree):
+                return
+
+        stack = [node]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, Tree):
+                stack.extend(node.values())
+            else:
+                for entry in node:
+                    yield entry
 
 
 MANIFEST_HASH_MAPPING = {

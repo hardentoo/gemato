@@ -3,6 +3,7 @@
 # (c) 2017 Michał Górny
 # Licensed under the terms of 2-clause BSD license
 
+import collections
 import errno
 import os.path
 
@@ -12,6 +13,120 @@ import gemato.manifest
 import gemato.profile
 import gemato.util
 import gemato.verify
+
+
+class _ManifestMap(collections.MutableMapping):
+    __slots__ = [
+        'size',
+        'tree',
+    ]
+    def __init__(self):
+        self.tree = gemato.manifest.Tree()
+        self.size = 0
+
+    def __setitem__(self, k, v):
+        # cleanup self.dirname_map
+        try:
+            del self[k]
+        except KeyError:
+            pass
+        self.size += 1
+        elements = k.split(os.sep)
+        elements.reverse()
+        node = self.tree
+        while elements:
+            element = elements.pop()
+            if elements:
+                node = node[element]
+            else:
+                node[element] = (k, v)
+
+    def __getitem__(self, k):
+        node = self.tree
+        for element in k.split(os.sep):
+            node = node.get(element, self)
+            if node is self:
+                raise KeyError(k)
+        return node[1]
+
+    def items(self):
+        stack = [self.tree]
+        while stack:
+            node = stack.pop()
+            for item in node.values():
+                if isinstance(item, gemato.manifest.Tree):
+                    stack.append(item)
+                else:
+                    yield item
+
+    def __iter__(self):
+        for k, v in self.items():
+            yield k
+
+    def __delitem__(self, k):
+        node = self.tree
+        stack = []
+        for element in k.split(os.sep):
+            node = node.get(element, self)
+            if node is self:
+                raise KeyError(k)
+            if isinstance(node, gemato.manifest.Tree):
+                stack.append((element, node))
+        node = stack[-1][1] if stack else self.tree
+        del node[element]
+        self.size -= 1
+
+        # recursively remove empty nodes
+        while stack:
+            element, node = stack.pop()
+            if stack and not node:
+                del stack[-1][1][element]
+            else:
+                break
+
+    def __contains__(self, k):
+        try:
+            self[k]
+        except KeyError:
+            return False
+        else:
+            return True
+
+    def __len__(self):
+        return self.size
+
+    def iter_unordered_manifests_for_path(self, path, recursive=False):
+        node = self.tree
+        stack = []
+        if path:
+            for child in node.values():
+                if not isinstance(child, gemato.manifest.Tree):
+                    yield (child[0], os.path.dirname(child[0]), child[1])
+            elements = path.split(os.sep)
+            elements.reverse()
+            while elements:
+                element = elements.pop()
+                node = node.get(element, self)
+                if node is self:
+                    break
+                if isinstance(node, gemato.manifest.Tree):
+                    if elements:
+                        for child in node.values():
+                            if not isinstance(child, gemato.manifest.Tree):
+                                yield (child[0], os.path.dirname(child[0]), child[1])
+                    else:
+                        stack.append(node)
+        else:
+            stack.append(node)
+
+        while stack:
+            node = stack.pop()
+            for child in node.values():
+                if isinstance(child, gemato.manifest.Tree):
+                    if recursive:
+                        stack.append(child)
+                else:
+                    yield (child[0], os.path.dirname(child[0]), child[1])
 
 
 class ManifestRecursiveLoader(object):
@@ -110,7 +225,7 @@ class ManifestRecursiveLoader(object):
 
         self.top_level_manifest_filename = os.path.basename(
                 top_manifest_path)
-        self.loaded_manifests = {}
+        self.loaded_manifests = _ManifestMap()
         self.updated_manifests = set()
 
         # TODO: allow catching OpenPGP exceptions somehow?
@@ -199,12 +314,8 @@ class ManifestRecursiveLoader(object):
 
         The entries will be returned in any order.
         """
-        for k, v in self.loaded_manifests.items():
-            d = os.path.dirname(k)
-            if gemato.util.path_starts_with(path, d):
-                yield (k, d, v)
-            elif recursive and gemato.util.path_starts_with(d, path):
-                yield (k, d, v)
+        return self.loaded_manifests.iter_unordered_manifests_for_path(
+                path.strip(os.sep), recursive=recursive)
 
     def _iter_manifests_for_path(self, path, recursive=False):
         """
@@ -233,17 +344,12 @@ class ManifestRecursiveLoader(object):
             to_load = []
             for curmpath, relpath, m in self._iter_manifests_for_path(
                                             path, recursive):
-                for e in m.entries:
-                    if e.tag != 'MANIFEST':
-                        continue
+                for e in m.traverse_manifests_for_path(
+                    path[len(relpath)+1:] if relpath else path, recursive=recursive):
                     mpath = os.path.join(relpath, e.path)
                     if curmpath == mpath or mpath in self.loaded_manifests:
                         continue
-                    mdir = os.path.dirname(mpath)
-                    if gemato.util.path_starts_with(path, mdir):
-                        to_load.append((mpath, e))
-                    elif recursive and gemato.util.path_starts_with(mdir, path):
-                        to_load.append((mpath, e))
+                    to_load.append((mpath, e))
             if not to_load:
                 break
             for mpath, e in to_load:
@@ -342,7 +448,7 @@ class ManifestRecursiveLoader(object):
                     return e
         return None
 
-    def get_file_entry_dict(self, path='', only_types=None):
+    def get_file_entry_dict(self, path='', only_types=None, recursive=True):
         """
         Find all file entries that apply to paths starting with @path.
         Return a dictionary mapping relative paths to entries. Raises
@@ -353,11 +459,15 @@ class ManifestRecursiveLoader(object):
         for local files will be processed.
         """
 
-        self.load_manifests_for_path(path, recursive=True)
+        self.load_manifests_for_path(path, recursive=recursive)
         out = {}
         for mpath, relpath, m in self._iter_manifests_for_path(path,
-                                    recursive=True):
-            for e in m.entries:
+                                    recursive=recursive):
+            if (relpath and not gemato.util.path_starts_with(path, relpath) and
+                not (recursive and gemato.util.path_starts_with(relpath, path))):
+                continue
+            for e in m.find_entries_path_starts_with(
+                path[len(relpath)+1:] if relpath else path):
                 if only_types is not None:
                     if e.tag not in only_types:
                         continue
@@ -427,17 +537,25 @@ class ManifestRecursiveLoader(object):
         it with 'rsync --times')!
         """
 
-        entry_dict = self.get_file_entry_dict(path)
         it = os.walk(os.path.join(self.root_directory, path),
                 onerror=gemato.util.throw_exception,
                 followlinks=True)
         ret = True
+        manifest_stack = []
+        remaining_entries = {}
 
         for dirpath, dirnames, filenames in it:
             relpath = os.path.relpath(dirpath, self.root_directory)
             # strip dot to avoid matching problems
             if relpath == '.':
                 relpath = ''
+
+            entry_dict = self.get_file_entry_dict(relpath, recursive=False)
+
+            depth = relpath.count(os.sep) + 1 if relpath else 0
+            while manifest_stack and depth <= manifest_stack[-1][1]:
+                prev_manifest, prev_depth = manifest_stack.pop()
+                del self.loaded_manifests[prev_manifest]
 
             skip_dirs = []
             for d in dirnames:
@@ -479,8 +597,13 @@ class ManifestRecursiveLoader(object):
                 ret &= self._verify_one_file(os.path.join(dirpath, f),
                         fpath, fe, fail_handler, last_mtime)
 
+                if fe is not None and fe.tag == 'MANIFEST':
+                    manifest_stack.append((fpath, depth))
+
+            remaining_entries.update(entry_dict)
+
         # check for missing files
-        for relpath, e in entry_dict.items():
+        for relpath, e in remaining_entries.items():
             syspath = os.path.join(self.root_directory, relpath)
             ret &= self._verify_one_file(syspath, relpath, e,
                             fail_handler, last_mtime)
