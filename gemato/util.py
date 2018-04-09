@@ -6,6 +6,11 @@
 import multiprocessing
 import sys
 
+try:
+	from concurrent.futures import ProcessPoolExecutor
+except ImportError:
+	ProcessPoolExecutor = None
+
 
 class MultiprocessingPoolWrapper(object):
     """
@@ -16,16 +21,25 @@ class MultiprocessingPoolWrapper(object):
     __slots__ = ['pool']
 
     def __init__(self, processes):
-        self.pool = multiprocessing.Pool(processes=processes)
+        # ProcessPoolExecutor.map supports chunksize in python3.5+,
+        # use it as a possible workaround for imap_unordered deadlock
+        # reported in https://bugs.gentoo.org/647964.
+        if sys.version_info >= (3, 5):
+            self.pool = ProcessPoolExecutor(max_workers=processes)
+        else:
+            self.pool = multiprocessing.Pool(processes=processes)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, exc_cb):
-        if exc_type is None:
-            self.pool.close()
-            self.pool.join()
-        self.pool.terminate()
+        if hasattr(self.pool, 'shutdown'):
+            self.pool.shutdown()
+        else:
+            if exc_type is None:
+                self.pool.close()
+                self.pool.join()
+            self.pool.terminate()
 
     def map(self, *args, **kwargs):
         return self.pool.map(*args, **kwargs)
@@ -35,12 +49,7 @@ class MultiprocessingPoolWrapper(object):
         Use imap_unordered() if available and safe to use. Fall back
         to regular map() otherwise.
         """
-        if sys.hexversion >= 0x03050400:
-            return self.pool.imap_unordered(*args, **kwargs)
-        else:
-            # in py<3.5.4 imap() swallows exceptions, so fall back
-            # to regular map()
-            return self.pool.map(*args, **kwargs)
+        return self.pool.map(*args, **kwargs)
 
 
 def path_starts_with(path, prefix):
