@@ -3,6 +3,13 @@
 # (c) 2017-2018 Michał Górny
 # Licensed under the terms of 2-clause BSD license
 
+try:
+    import asyncio
+except ImportError:
+    asyncio = None
+
+import multiprocessing
+
 
 class MultiprocessingPoolWrapper(object):
     """
@@ -14,10 +21,10 @@ class MultiprocessingPoolWrapper(object):
     of the issues is found and fixed or worked around.
     """
 
-    __slots__ = []
+    __slots__ = ['processes']
 
     def __init__(self, processes):
-        pass
+        self.processes = processes or 1
 
     def __enter__(self):
         return self
@@ -26,7 +33,68 @@ class MultiprocessingPoolWrapper(object):
         pass
 
     def map(self, func, it, chunksize=None):
-        return map(func, it)
+        if self.processes == 1 or asyncio is None:
+            return map(func, it)
+
+        def target(x, pipe):
+            try:
+                result = func(x)
+                exception = None
+            except Exception as e:
+                result = None
+                exception = e
+
+            try:
+                pipe.send((result, exception))
+            except BrokenPipeError:
+                pass
+
+        def reader_callback(pipe, future):
+            try:
+                future.set_result(pipe.recv())
+            finally:
+                loop.remove_reader(pipe.fileno())
+                pipe.close()
+
+        readers = set()
+        procs = {}
+        loop = asyncio.get_event_loop()
+        it = iter(it)
+
+        try:
+            while True:
+                x = next(it, None)
+                if x is not None:
+                    pr, pw = multiprocessing.Pipe(duplex=False)
+                    proc = multiprocessing.Process(target=target, args=(x, pw))
+                    proc.start()
+                    pw.close()
+                    reader = asyncio.Future()
+                    loop.add_reader(pr.fileno(), reader_callback, pr, reader)
+                    readers.add(reader)
+                    procs[id(reader)] = (proc, pr, reader)
+                    if len(procs) < self.processes:
+                        continue
+
+                if not (x or procs):
+                    break
+
+                done, readers = loop.run_until_complete(
+                    asyncio.wait(readers, return_when=asyncio.ALL_COMPLETED))
+                for reader in done:
+                    (proc, pr, reader) = procs.pop(id(reader))
+                    proc.join()
+                    result, exception = reader.result()
+                    if exception is None:
+                        yield result
+                    else:
+                        raise exception
+        finally:
+            while procs:
+                reader_id, (proc, pr, reader) = procs.popitem()
+                loop.remove_reader(pr.fileno())
+                proc.terminate()
+                proc.join()
 
     def imap_unordered(self, *args, **kwargs):
         """
